@@ -2,19 +2,33 @@
 
 import asyncio
 import logging
+import os
+import secrets
 import threading
 from copy import deepcopy
+from time import monotonic
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, abort, jsonify, render_template_string, request, session
 
 import tools
 from agents import CONFIDENCE_THRESHOLD, triage
 from client import MCPHub
 
 app = Flask(__name__)
+app.secret_key = secrets.token_bytes(32)
 app.config["MAX_CONTENT_LENGTH"] = 1024
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("RENDER") == "true"
 logger = logging.getLogger(__name__)
 _state_lock = threading.RLock()
+_sessions = {}
+_session_last_used = {}
+_SESSION_TTL_SECONDS = 2 * 60 * 60
+_MAX_SESSIONS = 500
+_mcp_lock = threading.Lock()
+_mcp_loop = None
+_mcp_hub = None
 
 
 def _sample_tickets():
@@ -32,69 +46,133 @@ def _sample_tickets():
     ]
 
 
-_state = {
-    "status": "idle",
-    "tickets": _sample_tickets(),
-    "events": [],
-    "next_event_id": 1,
-    "running_ticket_id": None,
-    "last_ticket_id": None,
-    "error": None,
-}
+def _new_state():
+    return {
+        "status": "idle",
+        "tickets": _sample_tickets(),
+        "events": [],
+        "next_event_id": 1,
+        "running_ticket_id": None,
+        "last_ticket_id": None,
+        "error": None,
+    }
 
 
-def _append_event(event):
+def _get_state(session_id, create=True, touch=True):
+    with _state_lock:
+        now = monotonic()
+        expired = [
+            key for key, last_used in _session_last_used.items()
+            if now - last_used > _SESSION_TTL_SECONDS
+            and _sessions[key]["status"] != "running"
+        ]
+        for key in expired:
+            _sessions.pop(key, None)
+            _session_last_used.pop(key, None)
+        state = _sessions.get(session_id)
+        if state is None and create:
+            if len(_sessions) >= _MAX_SESSIONS:
+                raise RuntimeError("The demo has reached its session limit. Try again later.")
+            state = _new_state()
+            _sessions[session_id] = state
+        if state is not None and touch:
+            _session_last_used[session_id] = now
+        return state
+
+
+def _browser_session_id(touch=False):
+    session_id = session.get("demo_id")
+    if not isinstance(session_id, str) or not session_id or _get_state(
+        session_id, create=False, touch=touch
+    ) is None:
+        session_id = secrets.token_urlsafe(32)
+        session["demo_id"] = session_id
+        _get_state(session_id)
+    return session_id
+
+
+def _append_event(state, event):
     event = deepcopy(event)
-    event["id"] = _state["next_event_id"]
-    _state["next_event_id"] += 1
-    _state["events"].append(event)
+    event.pop("session_id", None)
+    if isinstance(event.get("arguments"), dict):
+        event["arguments"].pop("session_id", None)
+    event["id"] = state["next_event_id"]
+    state["next_event_id"] += 1
+    state["events"].append(event)
 
 
 def _record_mcp_event(event):
+    session_id = event.get("session_id")
     with _state_lock:
+        state = _get_state(session_id, create=False)
+        if state is None:
+            return
         ticket_id = event.get("ticket_id")
         if event["type"] == "agent":
-            _append_event(event)
+            _append_event(state, event)
             return
 
         if event.get("phase") == "response" and event["tool"] == "update_ticket":
             result = event.get("result", {})
             if not result.get("error"):
-                for ticket in _state["tickets"]:
+                for ticket in state["tickets"]:
                     if ticket["id"] == ticket_id:
                         ticket.update(result)
                         break
-        _append_event(event)
+        _append_event(state, event)
 
 
-async def _run_ticket(ticket_id):
-    async with MCPHub(on_event=_record_mcp_event) as hub:
-        await triage(hub, ticket_id)
+async def _open_mcp_hub():
+    hub = MCPHub(on_event=_record_mcp_event)
+    await hub.__aenter__()
+    return hub
 
 
-def _run_demo(ticket_id):
+def _ensure_mcp_hub():
+    global _mcp_loop, _mcp_hub
+    with _mcp_lock:
+        if _mcp_loop is None:
+            _mcp_loop = asyncio.new_event_loop()
+            threading.Thread(
+                target=_mcp_loop.run_forever,
+                name="ticket-mcp-loop",
+                daemon=True,
+            ).start()
+        if _mcp_hub is None:
+            opening = asyncio.run_coroutine_threadsafe(_open_mcp_hub(), _mcp_loop)
+            _mcp_hub = opening.result(timeout=30)
+        return _mcp_loop, _mcp_hub
+
+
+def _finish_demo(session_id, ticket_id, future):
     try:
-        asyncio.run(_run_ticket(ticket_id))
+        future.result()
     except Exception as error:
         logger.exception("Ticket demo run failed")
         with _state_lock:
-            _state["status"] = "failed"
-            _state["running_ticket_id"] = None
-            _state["error"] = str(error)
-            for ticket in _state["tickets"]:
+            state = _get_state(session_id, create=False)
+            if state is None:
+                return
+            state["status"] = "failed"
+            state["running_ticket_id"] = None
+            state["error"] = str(error)
+            for ticket in state["tickets"]:
                 if ticket["id"] == ticket_id:
                     ticket["status"] = "failed"
                     break
-            _append_event({"type": "error", "detail": str(error)})
+            _append_event(state, {"type": "error", "detail": str(error)})
         return
 
     with _state_lock:
-        _state["running_ticket_id"] = None
-        _state["last_ticket_id"] = ticket_id
+        state = _get_state(session_id, create=False)
+        if state is None:
+            return
+        state["running_ticket_id"] = None
+        state["last_ticket_id"] = ticket_id
         all_finished = all(ticket["status"] in ("resolved", "escalated")
-                           for ticket in _state["tickets"])
-        _state["status"] = "completed" if all_finished else "idle"
-        _append_event({
+                           for ticket in state["tickets"])
+        state["status"] = "completed" if all_finished else "idle"
+        _append_event(state, {
             "type": "complete",
             "ticket_id": ticket_id,
             "detail": f"Ticket #{ticket_id} has been processed.",
@@ -734,6 +812,10 @@ PAGE = """<!doctype html>
 
 @app.get("/")
 def index():
+    try:
+        _browser_session_id(touch=True)
+    except RuntimeError as error:
+        abort(503, description=str(error))
     return render_template_string(PAGE, confidence_threshold=f"{CONFIDENCE_THRESHOLD:.2f}")
 
 
@@ -743,19 +825,23 @@ def get_state():
         after = max(0, int(request.args.get("after", "0")))
     except ValueError:
         return jsonify(error="after must be a non-negative integer"), 400
+    try:
+        state = _get_state(_browser_session_id())
+    except RuntimeError as error:
+        return jsonify(error=str(error)), 503
     with _state_lock:
-        events = [event for event in _state["events"] if event["id"] > after]
+        events = [event for event in state["events"] if event["id"] > after]
         tool_calls = sum(event["type"] == "tool" and event["phase"] == "request"
-                         for event in _state["events"])
+                         for event in state["events"])
         return jsonify(
-            status=_state["status"],
-            tickets=deepcopy(_state["tickets"]),
+            status=state["status"],
+            tickets=deepcopy(state["tickets"]),
             events=deepcopy(events),
-            latest_event_id=_state["next_event_id"] - 1,
+            latest_event_id=state["next_event_id"] - 1,
             tool_calls=tool_calls,
-            running_ticket_id=_state["running_ticket_id"],
-            last_ticket_id=_state["last_ticket_id"],
-            error=_state["error"],
+            running_ticket_id=state["running_ticket_id"],
+            last_ticket_id=state["last_ticket_id"],
+            error=state["error"],
         )
 
 
@@ -766,52 +852,79 @@ def start_run():
     if isinstance(ticket_id, bool) or not isinstance(ticket_id, int):
         return jsonify(error="ticket_id must be an integer"), 400
 
+    try:
+        session_id = _browser_session_id()
+        state = _get_state(session_id)
+    except RuntimeError as error:
+        return jsonify(error=str(error)), 503
     with _state_lock:
-        if _state["status"] == "running":
+        if state["status"] == "running":
             return jsonify(error="Another ticket is already being processed."), 409
-        ticket = next((item for item in _state["tickets"] if item["id"] == ticket_id), None)
+        ticket = next((item for item in state["tickets"] if item["id"] == ticket_id), None)
+        if ticket is None:
+            return jsonify(error="Ticket not found."), 404
+        if ticket["status"] in ("resolved", "escalated"):
+            return jsonify(error="This ticket has already been processed."), 409
+
+    try:
+        loop, hub = _ensure_mcp_hub()
+    except Exception as error:
+        logger.exception("Could not start the MCP server")
+        return jsonify(error=f"Could not start the MCP server: {error}"), 503
+
+    with _state_lock:
+        if state["status"] == "running":
+            return jsonify(error="Another ticket is already being processed."), 409
+        ticket = next((item for item in state["tickets"] if item["id"] == ticket_id), None)
         if ticket is None:
             return jsonify(error="Ticket not found."), 404
         if ticket["status"] in ("resolved", "escalated"):
             return jsonify(error="This ticket has already been processed."), 409
 
         ticket.update(status="processing", category=None, priority=None, handled_by=None)
-        _state["status"] = "running"
-        _state["running_ticket_id"] = ticket_id
-        _state["last_ticket_id"] = None
-        _state["error"] = None
-        _append_event({
+        state["status"] = "running"
+        state["running_ticket_id"] = ticket_id
+        state["last_ticket_id"] = None
+        state["error"] = None
+        _append_event(state, {
             "type": "agent",
             "agent": "Classifier",
             "ticket_id": ticket_id,
+            "session_id": session_id,
             "action": "ticket started",
             "detail": f"Customer query sent to the classifier for ticket #{ticket_id}.",
         })
-        threading.Thread(
-            target=_run_demo,
-            args=(ticket_id,),
-            name=f"ticket-demo-{ticket_id}",
-            daemon=True,
-        ).start()
+        future = asyncio.run_coroutine_threadsafe(
+            triage(hub, ticket_id, session_id), loop
+        )
+        future.add_done_callback(
+            lambda completed: _finish_demo(session_id, ticket_id, completed)
+        )
     return jsonify(status="running", ticket_id=ticket_id), 202
 
 
 @app.post("/api/reset")
 def reset_demo():
+    try:
+        session_id = _browser_session_id()
+        state = _get_state(session_id)
+    except RuntimeError as error:
+        return jsonify(error=str(error)), 503
     with _state_lock:
-        if _state["status"] != "completed":
+        if state["status"] != "completed":
             return jsonify(error="All tickets must be processed before resetting."), 409
-        tools.init_data(reset=True)
-        _state.clear()
-        _state.update({
-            "status": "idle",
-            "tickets": _sample_tickets(),
-            "events": [],
-            "next_event_id": 1,
-            "running_ticket_id": None,
-            "last_ticket_id": None,
-            "error": None,
-        })
+    try:
+        loop, hub = _ensure_mcp_hub()
+        reset = asyncio.run_coroutine_threadsafe(
+            hub.call("reset_demo", session_id=session_id), loop
+        )
+        reset.result(timeout=30)
+    except Exception as error:
+        logger.exception("Could not reset the MCP demo session")
+        return jsonify(error=f"Could not reset demo: {error}"), 502
+
+    with _state_lock:
+        state.update(_new_state())
     return jsonify(status="idle")
 
 

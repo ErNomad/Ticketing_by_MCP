@@ -24,9 +24,11 @@ when its answer resolves the ticket, or Escalation when the ticket is routed to 
 Only the final outcome is highlighted after playback finishes; the alternative stays neutral.
 Incompatible escalation-team tools are shown in red.
 After all five tickets have been processed, use **Reset all** to clear the activity and restart
-the in-memory demo.
-The database is not needed: ticket state, replies, escalations, and audit events are stored in
-memory and reset when the service restarts.
+your demo. Each browser gets its own signed session and isolated in-memory tickets, MCP activity,
+replies, and escalations. Sessions expire after two hours of inactivity; the in-memory data is
+also cleared when the service restarts. The single service instance supports up to 500 sessions;
+when full, new sessions receive a retry-later response rather than replacing an active demo. No
+database is required.
 
 To run the command-line version, use `python demo.py` for MCP or `python demo.py --direct` to call
 the same tools in-process.
@@ -39,8 +41,8 @@ Create a **Web Service** using the Python runtime and configure:
 - **Start command:** `gunicorn dashboard:app --bind 0.0.0.0:$PORT --workers 1 --threads 4`
 - **Health check path:** `/healthz`
 
-Render supplies `PORT`. Keep one Gunicorn worker: the demo's run state and event stream are
-intentionally held in process memory and are not shared across workers or service instances.
+Render supplies `PORT`. Keep one Gunicorn worker and one service instance: each worker keeps its
+own in-memory browser sessions and MCP server, so state is not shared across workers or instances.
 
 The dashboard is public and has no authentication. It uses sample data only; it is not connected
 to a real ticketing system and is not suitable for real customer or confidential support data.

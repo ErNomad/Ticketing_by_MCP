@@ -120,8 +120,9 @@ class EscalationAgent(Agent):
                        f"ref {result['reference']} via {decision['escalation_tool']}; {reason}")
 
 
-async def triage(hub, ticket_id):
+async def triage(hub, ticket_id, session_id="default"):
     """Route one ticket through the classifier, responder, and when needed escalation."""
+    hub.set_session_id(session_id)
     classifier, responder, escalation = ClassifierAgent(hub), ResponderAgent(hub), EscalationAgent(hub)
 
     decision = await classifier.handle(ticket_id)

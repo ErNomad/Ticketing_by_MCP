@@ -1,8 +1,10 @@
 """In-memory demo data and business logic exposed through MCP tools."""
 
 from copy import deepcopy
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from threading import RLock
+from time import monotonic
 
 # ---------------------------------------------------------------- knowledge base
 
@@ -44,63 +46,92 @@ SEED_TICKETS = [
 ]
 
 _lock = RLock()
-_tickets = []
-_replies = []
-_escalations = []
-_events = []
+_sessions = {}
+_session_last_used = {}
+_SESSION_TTL_SECONDS = 2 * 60 * 60
+_MAX_SESSIONS = 500
 
 
 def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def init_data(reset=False):
-    """Load the sample tickets; reset all demo activity when requested."""
-    global _tickets, _replies, _escalations, _events
+def _new_session_data():
+    return {
+        "tickets": [
+            {
+                "id": ticket_id,
+                "customer": customer,
+                "text": text,
+                "customer_feedback": feedback,
+                "category": None,
+                "priority": None,
+                "status": "new",
+                "handled_by": None,
+            }
+            for ticket_id, (customer, text, feedback) in enumerate(SEED_TICKETS, 1)
+        ],
+        "replies": [],
+        "escalations": [],
+        "events": [],
+    }
+
+
+@contextmanager
+def _session_data(session_id):
+    if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
+        raise ValueError("A valid demo session ID is required.")
     with _lock:
-        if reset or not _tickets:
-            _tickets = [
-                {
-                    "id": ticket_id,
-                    "customer": customer,
-                    "text": text,
-                    "customer_feedback": feedback,
-                    "category": None,
-                    "priority": None,
-                    "status": "new",
-                    "handled_by": None,
-                }
-                for ticket_id, (customer, text, feedback) in enumerate(SEED_TICKETS, 1)
-            ]
-            _replies = []
-            _escalations = []
-            _events = []
+        now = monotonic()
+        expired = [
+            key for key, last_used in _session_last_used.items()
+            if now - last_used > _SESSION_TTL_SECONDS
+        ]
+        for key in expired:
+            _sessions.pop(key, None)
+            _session_last_used.pop(key, None)
+        if session_id not in _sessions:
+            if len(_sessions) >= _MAX_SESSIONS:
+                raise RuntimeError("The demo has reached its session limit.")
+            _sessions[session_id] = _new_session_data()
+        _session_last_used[session_id] = now
+        yield _sessions[session_id]
 
 
-init_data()
+def init_data(reset=False, session_id="default"):
+    """Initialize or reset one demo's in-memory data."""
+    if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
+        raise ValueError("A valid demo session ID is required.")
+    with _lock:
+        if session_id not in _sessions and len(_sessions) >= _MAX_SESSIONS:
+            raise RuntimeError("The demo has reached its session limit.")
+        if reset or session_id not in _sessions:
+            _sessions[session_id] = _new_session_data()
+        _session_last_used[session_id] = monotonic()
 
 # ---------------------------------------------------------------- tickets tools
 
-def list_new_tickets() -> list:
-    with _lock:
+def list_new_tickets(session_id="default") -> list:
+    with _session_data(session_id) as data:
         return [
             {key: ticket[key] for key in ("id", "customer", "text")}
-            for ticket in _tickets if ticket["status"] == "new"
+            for ticket in data["tickets"] if ticket["status"] == "new"
         ]
 
 
-def get_ticket(ticket_id: int) -> dict:
-    with _lock:
-        for ticket in _tickets:
+def get_ticket(ticket_id: int, session_id="default") -> dict:
+    with _session_data(session_id) as data:
+        for ticket in data["tickets"]:
             if ticket["id"] == ticket_id:
                 return {key: value for key, value in ticket.items() if key != "customer_feedback"}
         return {"error": f"ticket {ticket_id} not found"}
 
 
 def update_ticket(ticket_id: int, status: str = "", category: str = "",
-                  priority: str = "", handled_by: str = "") -> dict:
-    with _lock:
-        for ticket in _tickets:
+                  priority: str = "", handled_by: str = "",
+                  session_id="default") -> dict:
+    with _session_data(session_id) as data:
+        for ticket in data["tickets"]:
             if ticket["id"] == ticket_id:
                 for key, value in (
                     ("status", status),
@@ -115,29 +146,31 @@ def update_ticket(ticket_id: int, status: str = "", category: str = "",
         return {"error": f"ticket {ticket_id} not found"}
 
 
-def send_reply(ticket_id: int, message: str) -> dict:
-    with _lock:
-        if not any(ticket["id"] == ticket_id for ticket in _tickets):
+def send_reply(ticket_id: int, message: str, session_id="default") -> dict:
+    with _session_data(session_id) as data:
+        if not any(ticket["id"] == ticket_id for ticket in data["tickets"]):
             return {"error": f"ticket {ticket_id} not found"}
-        reply_id = len(_replies) + 1
-        _replies.append(
+        reply_id = len(data["replies"]) + 1
+        data["replies"].append(
             {"id": reply_id, "ticket_id": ticket_id, "message": message, "created": _now()}
         )
         return {"ok": True, "reply_id": reply_id}
 
 
-def get_customer_feedback(ticket_id: int) -> dict:
+def get_customer_feedback(ticket_id: int, session_id="default") -> dict:
     """Simulates the customer's answer to our reply (in real life this arrives later)."""
-    with _lock:
-        for ticket in _tickets:
+    with _session_data(session_id) as data:
+        for ticket in data["tickets"]:
             if ticket["id"] == ticket_id:
                 return {"feedback": ticket["customer_feedback"]}
         return {"error": f"ticket {ticket_id} not found", "feedback": ""}
 
 # ---------------------------------------------------------------- knowledge base tool
 
-def search_kb(query: str) -> dict:
+def search_kb(query: str, session_id="default") -> dict:
     """Keyword match. Each matching keyword adds 0.35 confidence (capped at 1.0)."""
+    with _session_data(session_id):
+        pass
     text = query.lower()
     best = {"article_id": None, "title": None, "steps": [], "confidence": 0.0}
     for article in KB_ARTICLES:
@@ -150,35 +183,36 @@ def search_kb(query: str) -> dict:
 
 # ---------------------------------------------------------------- escalation tools
 
-def _escalate(team: str, prefix: str, ticket_id: int, summary: str) -> dict:
-    with _lock:
-        if not any(ticket["id"] == ticket_id for ticket in _tickets):
+def _escalate(team: str, prefix: str, ticket_id: int, summary: str, session_id) -> dict:
+    with _session_data(session_id) as data:
+        if not any(ticket["id"] == ticket_id for ticket in data["tickets"]):
             return {"error": f"ticket {ticket_id} not found"}
-        row_id = len(_escalations) + 1
+        row_id = len(data["escalations"]) + 1
         reference = f"{prefix}-{row_id:04d}"
-        _escalations.append(
+        data["escalations"].append(
             {"reference": reference, "team": team, "ticket_id": ticket_id,
              "summary": summary, "created": _now()}
         )
         return {"reference": reference, "team": team}
 
 
-def escalate_to_security_team(ticket_id: int, summary: str) -> dict:
-    return _escalate("Security Team", "SEC", ticket_id, summary)
+def escalate_to_security_team(ticket_id: int, summary: str, session_id="default") -> dict:
+    return _escalate("Security Team", "SEC", ticket_id, summary, session_id)
 
 
-def escalate_to_billing_team(ticket_id: int, summary: str) -> dict:
-    return _escalate("Billing Team", "BILL", ticket_id, summary)
+def escalate_to_billing_team(ticket_id: int, summary: str, session_id="default") -> dict:
+    return _escalate("Billing Team", "BILL", ticket_id, summary, session_id)
 
 
-def escalate_to_it_support(ticket_id: int, summary: str) -> dict:
-    return _escalate("IT Support", "IT", ticket_id, summary)
+def escalate_to_it_support(ticket_id: int, summary: str, session_id="default") -> dict:
+    return _escalate("IT Support", "IT", ticket_id, summary, session_id)
 
 # ---------------------------------------------------------------- audit tool
 
-def log_event(agent: str, ticket_id: int, action: str, detail: str = "") -> dict:
-    with _lock:
-        _events.append(
+def log_event(agent: str, ticket_id: int, action: str, detail: str = "",
+              session_id="default") -> dict:
+    with _session_data(session_id) as data:
+        data["events"].append(
             {"ts": _now(), "agent": agent, "ticket_id": ticket_id,
              "action": action, "detail": detail}
         )
@@ -186,19 +220,19 @@ def log_event(agent: str, ticket_id: int, action: str, detail: str = "") -> dict
 
 # ---------------------------------------------------------------- read helpers
 
-def all_tickets():
-    with _lock:
+def all_tickets(session_id="default"):
+    with _session_data(session_id) as data:
         return [
             {key: value for key, value in ticket.items() if key != "customer_feedback"}
-            for ticket in _tickets
+            for ticket in data["tickets"]
         ]
 
 
-def all_events():
-    with _lock:
-        return deepcopy(_events)
+def all_events(session_id="default"):
+    with _session_data(session_id) as data:
+        return deepcopy(data["events"])
 
 
-def all_escalations():
-    with _lock:
-        return deepcopy(_escalations)
+def all_escalations(session_id="default"):
+    with _session_data(session_id) as data:
+        return deepcopy(data["escalations"])

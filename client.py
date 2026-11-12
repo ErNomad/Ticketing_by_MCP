@@ -2,6 +2,7 @@
 
 import json
 import sys
+from contextvars import ContextVar
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -27,37 +28,45 @@ TOOL_CATEGORIES = {
 class Hub:
     def __init__(self, on_event=None):
         self.on_event = on_event
-        self.current_ticket_id = None
-        self.current_agent = None
+        hub_id = id(self)
+        self._session_id = ContextVar(f"hub_session_{hub_id}", default="default")
+        self._current_ticket_id = ContextVar(f"hub_ticket_{hub_id}", default=None)
+        self._current_agent = ContextVar(f"hub_agent_{hub_id}", default=None)
+
+    def set_session_id(self, session_id):
+        self._session_id.set(session_id)
 
     def _emit(self, event):
         if self.on_event is not None:
             self.on_event(event)
 
     def agent_event(self, agent, ticket_id, action, detail):
-        self.current_agent = agent
-        self.current_ticket_id = ticket_id
+        self._current_agent.set(agent)
+        self._current_ticket_id.set(ticket_id)
         self._emit({
             "type": "agent",
             "agent": agent,
             "ticket_id": ticket_id,
+            "session_id": self._session_id.get(),
             "action": action,
             "detail": detail,
         })
 
     async def call(self, tool, **args):
+        args.setdefault("session_id", self._session_id.get())
         if tool != "log_event":  # keep the trace readable
             shown = ", ".join(f"{k}={v[:35]!r}" if isinstance(v, str) else f"{k}={v}"
-                              for k, v in args.items())
+                              for k, v in args.items() if k != "session_id")
             print(f"        tool call: {tool}({shown})")
         if "ticket_id" in args:
-            self.current_ticket_id = args["ticket_id"]
+            self._current_ticket_id.set(args["ticket_id"])
         event = {
             "type": "tool",
             "tool": tool,
             "category": TOOL_CATEGORIES.get(tool, "Other"),
-            "ticket_id": self.current_ticket_id,
-            "agent": self.current_agent,
+            "ticket_id": self._current_ticket_id.get(),
+            "session_id": args["session_id"],
+            "agent": self._current_agent.get(),
             "arguments": args,
             "phase": "request",
         }
@@ -68,7 +77,7 @@ class Hub:
             self._emit({**event, "phase": "error", "detail": str(error)})
             raise
         if tool == "get_ticket" and not result.get("error"):
-            self.current_ticket_id = result["id"]
+            self._current_ticket_id.set(result["id"])
         self._emit({**event, "phase": "response", "result": result})
         return result
 
